@@ -1,98 +1,51 @@
 from machine import Pin, Encoder
-import uasyncio as asyncio
+import time
+import ujson as json
+
+# TO DO: Mapear los valores del encoder a azimuth.
+# TO DO: protección por si el encoder se queda colgado.
 
 class Base:
-  def __init__(self):
-    self.AtHome = False
-    self.AtPark = False
-    self.park_position = 20
-    self.Azimuth = 0
-    self.Slewing = False
-    self.Slaved = False
-    self.FindingHome = False
-    self.encoder = Encoder(0, Pin(25), Pin(33), x=4)
-    self.initialized = False
-    self.abort_requested = False
+  def __init__(self, mqtt_client):
+
+    self.at_park = False
+    self.azimuth = 0.0
+    self.desiredAzimuth = None
+    self.home_position = 0.0
+    self.at_home = False
+    self.slewing_to_home = False
     self.slewing_to_azimuth = False
-    self.home_position = 0
     self.slewing_to_park = False
-    self.slew_task = None
+    self.abort_requested = False
+    self.client = mqtt_client
+    self.last_update = time.ticks_ms()
+    self.last_state_publish = time.ticks_ms()
+
+    self.encoder = Encoder(0, Pin(25), Pin(33), x=4)
+    self.last_encoder_value = self.encoder.value()
+    self.encoder_stall_timer = time.ticks_ms()
+
+    self.initialized = False
 
     # Pines de los motores
     self.motor_right = Pin(26, Pin.OUT)
     self.motor_left = Pin(27, Pin.OUT)
     self.motor_left.value(0)
     self.motor_right.value(0)
-    self.desiredAzimuth = 0
 
     # Pin del sensor de home
     self.home_sensor = Pin(35, Pin.IN)
 
-    if self.home_sensor.value() == 1:
-      self.AtHome = True
-      self.initialized = True
-    else:
-      self.AtHome = False
-      self.initialized = False
-
     # Interrupciones del sensor home
     # self.home_sensor.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=self._updateHomeStatus)
 
-  async def track_slew_to_azimuth(self):
-    try:
-        while self.slewing_to_azimuth and not self.abort_requested:
-          self.Azimuth = self.encoder.value()
-          print('Azimuth: %f' % self.Azimuth)
-
-          if abs(self.Azimuth - self.desiredAzimuth) < 1.0:
-              self.motor_left.value(0)
-              self.motor_right.value(0)
-              self.Slewing = False
-              self.slewing_to_azimuth = False
-              print('Slew complete')
-              break
-
-          await asyncio.sleep(0.1)
-    except Exception as e:
-      print("Error en track_slew_to_azimuth:", e)
-
-  async def track_slew_to_park(self):
-    try:
-        while self.slewing_to_park and not self.abort_requested:
-          self.Azimuth = self.encoder.value()
-          print('Azimuth: %f' % self.Azimuth)
-
-          if abs(self.Azimuth - self.park_position) < 1.0:
-              self.motor_left.value(0)
-              self.motor_right.value(0)
-              self.Slewing = False
-              self.slewing_to_park = False
-              print('Park complete')
-              break
-
-          await asyncio.sleep(0.1)
-    except Exception as e:
-      print("Error en track_slew_to_park:", e)
-
-  async def track_find_home(self):
-    try:
-        while self.FindingHome and not self.abort_requested:
-          home_sensor = self.home_sensor.value()
-          print('Home sensor: %d' % home_sensor)
-          if self.home_sensor.value() == 1:
-              self.motor_left.value(0)
-              self.motor_right.value(0)
-              self.Slewing = False
-              self.FindingHome = False
-              self.AtHome = True
-              self.initialized = True
-              print(self.initialized)
-              print('Home found')
-              break
-
-          await asyncio.sleep(0.1)
-    except Exception as e:
-      print("Error en track_find_home:", e)
+    self.client.publish_message({
+      "dome_slewing": self.slewing_to_park or self.slewing_to_home or self.slewing_to_azimuth,
+      "at_park": self.at_park,
+      "azimuth": self.azimuth,
+      "at_home": self.at_home,
+      "base_online": True
+    })
 
   def _updateHomeStatus(self, pin):
     if self.home_sensor.value() == 1:
@@ -108,41 +61,25 @@ class Base:
       print('Home lost')
       self.AtHome = False
 
-  def getAtHome(self):
+  def _check_encoder_stall(self):
+    current = self.encoder.value()
 
-    if self.home_sensor.value() == 1:
-      self.AtHome = True
-      return True
+    if current == self.last_encoder_value:
+        if time.ticks_diff(time.ticks_ms(), self.encoder_stall_timer) > 2000:
+            print("Encoder stall detected")
+            self.abort_requested = True
+            return True
     else:
-      self.AtHome = False
-      return False
-  
-  def getAtPark(self):
+        self.encoder_stall_timer = time.ticks_ms()
+
+    self.last_encoder_value = current
+    self.azimuth = current
+    return False
+
     
-    if abs(self.park_position - self.Azimuth) < 1.0:
-      self.AtPark = True
-      return True
-    else:
-      self.AtPark = False
-      return False
-  
-  def getAzimuth(self):
-    azimuth = self.encoder.value()
-    if azimuth < 0:
-      azimuth += 360
-    elif azimuth > 360:
-      azimuth -= 360
-    self.Azimuth = azimuth
-    return self.Azimuth
-  
-  def getSlewing(self):
-    return self.Slewing
-  
-  def getSlaved(self):
-    return self.Slaved
-  
-  def getInitialized(self):
-    return self.initialized
+  def _stop_motors(self):
+    self.motor_left.value(0)
+    self.motor_right.value(0)
   
   def setSlaved(self, value):
     value = value.lower()
@@ -151,166 +88,230 @@ class Base:
     else: 
       self.Slaved = False
 
-  def setPark(self):
-    
-    self.park_position = self.Azimuth
-    self.AtPark = True
-    return 'Park position set to current azimuth.'
-
   def abortSlew(self):
     print('Abort slew')
-    self.motor_left.value(0)
-    self.motor_right.value(0)
-    self.Slewing = False
     self.abort_requested = True
 
   def findHome(self):
     print('Finding home')
-    if self.Slewing:
-      raise Exception('Dome is slewing.')
     
+    # Si se encuentra en home, retorna.
     if self.home_sensor.value() == 1:
-      self.AtHome = True
-      if not self.initialized:
-        self.initialize()
-      raise Exception('Dome is already at home position.')
+      return
     
-    if self.initialized:
-      self.FindingHome = True
+    self.slewing_to_home = True
+    self.abort_requested = False
 
-      endOfFringe = self.Azimuth + 180
+    # Si se encontraba realizando alguna operación de slewing, se cancela dicha operación,
+    # pero continúa en movimiento hasta encontrar home.
+    if self.slewing_to_azimuth or self.slewing_to_park:
+      self.slewing_to_azimuth = False
+      self.slewing_to_park = False
+      return
+    
+    # Si se conoce el azimut actual, se calcula la dirección de movimiento para encontrar
+    # home.
+    if self.initialized:
+
+      endOfFringe = self.azimuth + 180
 
       if (endOfFringe > 360):
         endOfFringe -= 360
         print('endOfFringe: %f' % endOfFringe)
-        if ((self.home_position > self.Azimuth and self.home_position < 360) or 
+        if ((self.home_position > self.azimuth and self.home_position < 360) or 
             (self.home_position > 0 and self.home_position < endOfFringe) or
             self.home_position == 0 or self.home_position == 360):
           print('derecha')
+          self._stop_motors()
           self.motor_right.value(1)
         else:
           print('izquierda')
+          self._stop_motors()
           self.motor_left.value(1)
       
       else:
 
-        if (self.home_position > self.Azimuth and self.home_position < endOfFringe):
+        if (self.home_position > self.azimuth and self.home_position < endOfFringe):
           print('derecha')
+          self._stop_motors()
           self.motor_right.value(1)
         else:
           print('izquierda')
+          self._stop_motors()
           self.motor_left.value(1)
+          
+    else:
+      self._stop_motors()
+      self.motor_right.value(1)
 
-      self.Slewing = True
-      self.FindingHome = True
-      self.abort_requested = False
-      
-      if self.slew_task is None or self.slew_task.done():
-        self.slew_task = asyncio.create_task(self.track_find_home())
-        return 'Dome is finding home.'
-    
-    self.FindingHome = True
-    self.Slewing = True
-    self.motor_right.value(1)
-
-    if self.slew_task is None or self.slew_task.done():
-      self.slew_task = asyncio.create_task(self.track_find_home())
-
-    return 'Dome is finding home.'
+    return
 
   def park(self):
     print('Parking dome')
-    if self.Slewing:
-      raise Exception('Dome is slewing.')
-    
-    if abs(self.Azimuth - self.park_position) < 1.0:
-      self.AtPark = True
-      raise Exception('Dome is already at park position.')
 
-    endOfFringe = self.Azimuth + 180
+    # Si ya se encuentra en posición de park (que es la misma que home), retorna.
+    if self.home_sensor.value() == 1:
+      return
+    
+    if self.slewing_to_azimuth or self.slewing_to_home:
+      self.slewing_to_azimuth = False
+      self.slewing_to_home = False
+    
+    self.slewing_to_park = True
+    self.abort_requested = False
+
+    endOfFringe = self.azimuth + 180
 
     if (endOfFringe > 360):
       endOfFringe -= 360
       print('endOfFringe: %f' % endOfFringe)
-      if ((self.park_position > self.Azimuth and self.park_position < 360) or 
-          (self.park_position > 0 and self.park_position < endOfFringe) or
-          self.park_position == 0 or self.park_position == 360):
+      if ((self.home_position > self.azimuth and self.home_position < 360) or 
+          (self.home_position > 0 and self.home_position < endOfFringe) or
+          self.home_position == 0 or self.home_position == 360):
         print('derecha')
+        self._stop_motors()
         self.motor_right.value(1)
       else:
         print('izquierda')
+        self._stop_motors()
         self.motor_left.value(1)
     
     else:
 
-      if (self.park_position > self.Azimuth and self.park_position < endOfFringe):
+      if (self.home_position > self.azimuth and self.home_position < endOfFringe):
         print('derecha')
+        self._stop_motors()
         self.motor_right.value(1)
       else:
         print('izquierda')
+        self._stop_motors()
         self.motor_left.value(1)
 
-    self.Slewing = True
-    self.slewing_to_park = True
-    self.abort_requested = False
+    return
+
+  def slewToAzimuth(self, payload):
+
+    desiredAzimuth = payload["azimuth"]
+    if self.azimuth == desiredAzimuth:
+      return
     
-    if self.slew_task is None or self.slew_task.done():
-      self.slew_task = asyncio.create_task(self.track_slew_to_park())
-
-    return 'Dome is parking.'
-
-  def slewToAzimuth(self, desiredAzimuth):
-
-    ## Levantar error si ya se esta slewing?
-    if self.Slewing:
-      raise Exception('Dome is slewing.')
-
-    if self.Azimuth == desiredAzimuth:
-      return 'Dome is already at the desired azimuth.'
+    if self.slewing_to_park or self.slewing_to_home:
+      self.slewing_to_park = False
+      self.slewing_to_home = False
     
-    try:
-      desiredAzimuth = float(desiredAzimuth)
-    except ValueError:
-      raise Exception('Desired azimuth must be a float or numeric string.')
-
-    endOfFringe = self.Azimuth + 180
+    desiredAzimuth = float(desiredAzimuth)
+    endOfFringe = self.azimuth + 180
 
     if (endOfFringe > 360):
       endOfFringe -= 360
       print('endOfFringe: %f' % endOfFringe)
-      if ((desiredAzimuth > self.Azimuth and desiredAzimuth < 360) or 
+      if ((desiredAzimuth > self.azimuth and desiredAzimuth < 360) or 
           (desiredAzimuth > 0 and desiredAzimuth < endOfFringe) or
           desiredAzimuth == 0 or desiredAzimuth == 360):
         print('derecha')
+        self._stop_motors()
         self.motor_right.value(1)
       else:
         print('izquierda')
+        self._stop_motors()
         self.motor_left.value(1)
     
     else:
 
-      if (desiredAzimuth > self.Azimuth and desiredAzimuth < endOfFringe):
+      if (desiredAzimuth > self.azimuth and desiredAzimuth < endOfFringe):
         print('derecha')
+        self._stop_motors()
         self.motor_right.value(1)
       else:
         print('izquierda')
+        self._stop_motors()
         self.motor_left.value(1)
 
-    self.Slewing = True
-    self.desiredAzimuth = desiredAzimuth
     self.slewing_to_azimuth = True
+    self.desiredAzimuth = desiredAzimuth
     self.abort_requested = False
-
-    # Iniciar tarea asincrona de rastreo de posicion
-    if self.slew_task is None or self.slew_task.done():
-      self.slew_task = asyncio.create_task(self.track_slew_to_azimuth())
 
     return 'Slewing to azimuth'
 
-  def initialize(self):
-    
-    self.initialized = True
-    self.Azimuth = 0
-    self.encoder.value(0)
+  def getState(self):
+    self.publishState()
 
-    print('Dome initialized')
+  def update(self):
+    now = time.ticks_ms()
+
+    if time.ticks_diff(now, self.last_update) < 50:
+      return
+    
+    self.last_update = now
+
+    if self.abort_requested:
+      self._stop_motors()
+      self.slewing_to_azimuth = False
+      self.slewing_to_home = False
+      self.slewing_to_park = False
+      self.abort_requested = False
+      return
+
+    if self.slewing_to_azimuth:
+      self._update_slew_to_azimuth()
+    elif self.slewing_to_home: 
+      self._update_slew_to_home()
+    elif self.slewing_to_park:
+      self._update_slew_to_park()
+
+    if time.ticks_diff(now, self.last_state_publish) > 1000:
+      self.publishState()
+      self.last_state_publish = now
+
+  def _update_slew_to_azimuth(self):
+    if self._check_encoder_stall():
+      return
+    
+    print('Azimuth: %f' % self.azimuth)
+
+    if abs(self.azimuth - self.desiredAzimuth) < 1.0:
+      self._stop_motors()
+      self.slewing_to_azimuth = False
+      self.desiredAzimuth = None
+      print('Slew complete')
+
+  def _update_slew_to_home(self):
+    if self._check_encoder_stall():
+      return
+    
+    home_sensor = self.home_sensor.value()
+    print('Home sensor: %d' % home_sensor)
+    if home_sensor == 1:
+      self._stop_motors()
+      self.slewing_to_home = False
+      self.at_home = True
+      self.at_park = True
+      self.azimuth = self.home_position
+      self.initialized = True
+      print('Home found')
+
+  # Find home y park son equivalentes
+  def _update_slew_to_park(self):
+    if self._check_encoder_stall():
+      return
+    
+    home_sensor = self.home_sensor.value()
+
+    print('Azimuth: %f' % self.azimuth)
+    if home_sensor == 1:
+      self._stop_motors()
+      self.slewing_to_park = False
+      self.at_park = True
+      self.at_home = True
+      self.azimuth = self.home_position
+      self.initialized = True
+      print('Park complete')
+
+  def publishState(self):
+    self.client.publish_message({
+      "dome_slewing": self.slewing_to_park or self.slewing_to_home or self.slewing_to_azimuth,
+      "at_park": self.at_park,
+      "azimuth": self.azimuth,
+      "at_home": self.at_home,
+      "base_online": True
+    })
