@@ -1,12 +1,14 @@
 import network
 import esp
 import gc
+import json
+from config import CONFIG
 
 esp.osdebug(None)
 gc.collect()
 
-ssid = "INFINITUM3C47_2.4"
-password= "Ge4H6Z2HJ9"
+ssid = CONFIG["ssid"]
+password= CONFIG["password"]
 
 print("Conectando a internet...")
 

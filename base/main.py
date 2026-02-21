@@ -10,13 +10,12 @@ COMMANDS = {
     "findhome": device.findHome,
     "park": device.park,
     "slewtoazimuth": device.slewToAzimuth,
-    "get_state": device.handle_get_state
+    "get_state": device.getState
 }
 
 def on_message(client, msg):
     payload = msg.payload.decode("utf-8")
     payload = json.loads(payload)
-    print(payload)
     
     if payload["cmd"] in COMMANDS:
         handler = COMMANDS[payload["cmd"]]
@@ -32,8 +31,13 @@ def main():
 
     try:
         while True:
-            client.loop_once()
-            device.update()
+            try:
+                client.loop_once()
+                device.update()
+            except OSError as e:
+                print("Error MQTT:", e)
+                client.reconnect()
+
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("Cerrando...")
